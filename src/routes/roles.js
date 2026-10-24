@@ -59,44 +59,122 @@ router.get('/', async (req, res) => {
 
 // POST /api/roles
 // Create a new role.
-router.post('/', async (req, res) => {
+
+// POST /api/roles
+// Create a role and save its selected permissions.
+// Role location is not required from the frontend.
+router.post('/', async (req, res, next) => {
   const {
     name,
     description = '',
-    isHqRole = false,
+    permissions = [],
   } = req.body
 
-  if (!name?.trim()) {
+  if (typeof name !== 'string' || !name.trim()) {
     return res.status(400).json({
       message: 'Role name is required',
     })
   }
 
-  if (typeof isHqRole !== 'boolean') {
+  if (typeof description !== 'string') {
     return res.status(400).json({
-      message: 'isHqRole must be true or false',
+      message: 'Description must be a string',
     })
   }
 
+  if (
+    !Array.isArray(permissions) ||
+    !permissions.every((p) => typeof p === 'string')
+  ) {
+    return res.status(400).json({
+      message: 'Permissions must be an array of names',
+    })
+  }
+
+  let connection
+
   try {
-    const [result] = await pool.query(
+    connection = await pool.getConnection()
+    await connection.beginTransaction()
+
+    const uniquePermissions = [...new Set(permissions)]
+    let permissionRows = []
+
+    if (uniquePermissions.length > 0) {
+      const [rows] = await connection.query(
+        'SELECT id, name FROM permissions WHERE name IN (?)',
+        [uniquePermissions]
+      )
+
+      permissionRows = rows
+
+      const foundNames = new Set(
+        rows.map((permission) => permission.name)
+      )
+
+      const invalidPermissions = uniquePermissions.filter(
+        (permission) => !foundNames.has(permission)
+      )
+
+      if (invalidPermissions.length > 0) {
+        await connection.rollback()
+
+        return res.status(400).json({
+          message: 'Some selected permissions do not exist',
+          invalidPermissions,
+        })
+      }
+    }
+
+    // Keep the existing database column.
+    // New roles default to Branch (0).
+    const [result] = await connection.query(
       `INSERT INTO roles (name, description, is_hq_role)
        VALUES (?, ?, ?)`,
-      [name.trim(), description.trim(), isHqRole ? 1 : 0]
+      [name.trim(), description.trim(), 0]
     )
 
-    res.status(201).json({
-      message: 'Role created successfully',
+    const roleId = result.insertId
+
+    // Save selected permissions immediately.
+    if (permissionRows.length > 0) {
+      await connection.query(
+        `INSERT INTO role_permissions (role_id, permission_id)
+         VALUES ?`,
+        [
+          permissionRows.map((permission) => [
+            roleId,
+            permission.id,
+          ]),
+        ]
+      )
+    }
+
+    await connection.commit()
+
+    return res.status(201).json({
+      message: 'Role and permissions created successfully',
       role: {
-        id: result.insertId,
+        id: roleId,
         name: name.trim(),
         description: description.trim(),
-        isHqRole,
-        userCount: 0,
-        permissions: [],
+        permissions: permissionRows.map(
+          (permission) => permission.name
+        ),
       },
     })
   } catch (error) {
+    if (connection) {
+      try {
+        await connection.rollback()
+      } catch (rollbackError) {
+        console.error(
+          'Role creation rollback failed:',
+          rollbackError.message
+        )
+      }
+    }
+
     if (error.code === 'ER_DUP_ENTRY') {
       return res.status(409).json({
         message: 'A role with this name already exists',
@@ -104,18 +182,21 @@ router.post('/', async (req, res) => {
     }
 
     console.error('Create role error:', error)
-
-    res.status(500).json({
-      message: 'Failed to create role',
-    })
+    return next(error)
+  } finally {
+    connection?.release()
   }
 })
 
+
 // PUT /api/roles/:id
 // Update a role's name, description, and location.
+// PUT /api/roles/:id
+// Update role details and permissions.
+// Existing role location is preserved.
 router.put('/:id', async (req, res, next) => {
   const id = Number(req.params.id)
-  const { name, description, isHqRole } = req.body
+  const { name, description, permissions } = req.body
 
   if (!Number.isInteger(id) || id <= 0) {
     return res.status(400).json({
@@ -127,10 +208,11 @@ router.put('/:id', async (req, res, next) => {
     typeof name !== 'string' ||
     !name.trim() ||
     typeof description !== 'string' ||
-    typeof isHqRole !== 'boolean'
+    !Array.isArray(permissions) ||
+    !permissions.every((p) => typeof p === 'string')
   ) {
     return res.status(400).json({
-      message: 'Valid name, description, and isHqRole are required',
+      message: 'Valid name, description, and permissions are required',
     })
   }
 
@@ -141,7 +223,7 @@ router.put('/:id', async (req, res, next) => {
     await connection.beginTransaction()
 
     const [[role]] = await connection.query(
-      `SELECT id, name, is_hq_role AS isHqRole
+      `SELECT id, name
        FROM roles
        WHERE id = ?
        FOR UPDATE`,
@@ -150,26 +232,20 @@ router.put('/:id', async (req, res, next) => {
 
     if (!role) {
       await connection.rollback()
+
       return res.status(404).json({
         message: 'Role not found',
       })
     }
 
-    // Protect the Super Admin role name and location.
-    if (
-      role.name === 'Super Admin' &&
-      (
-        name.trim() !== role.name ||
-        isHqRole !== Boolean(role.isHqRole)
-      )
-    ) {
+    if (role.name === 'Super Admin') {
       await connection.rollback()
+
       return res.status(403).json({
-        message: 'Super Admin name and location cannot be changed',
+        message: 'Super Admin cannot be modified',
       })
     }
 
-    // Prevent duplicate names.
     const [[duplicate]] = await connection.query(
       'SELECT id FROM roles WHERE name = ? AND id <> ?',
       [name.trim(), id]
@@ -177,49 +253,93 @@ router.put('/:id', async (req, res, next) => {
 
     if (duplicate) {
       await connection.rollback()
+
       return res.status(409).json({
         message: 'A role with this name already exists',
       })
     }
 
-    // Do not change location while users are assigned to the role.
-    if (
-      isHqRole !== Boolean(role.isHqRole)
-    ) {
-      const [[usage]] = await connection.query(
-        'SELECT COUNT(*) AS total FROM users WHERE role_id = ?',
-        [id]
+    const uniquePermissions = [...new Set(permissions)]
+    let permissionRows = []
+
+    if (uniquePermissions.length > 0) {
+      const [rows] = await connection.query(
+        'SELECT id, name FROM permissions WHERE name IN (?)',
+        [uniquePermissions]
       )
 
-      if (Number(usage.total) > 0) {
+      permissionRows = rows
+
+      const foundNames = new Set(
+        rows.map((permission) => permission.name)
+      )
+
+      const invalidPermissions = uniquePermissions.filter(
+        (permission) => !foundNames.has(permission)
+      )
+
+      if (invalidPermissions.length > 0) {
         await connection.rollback()
-        return res.status(409).json({
-          message:
-            'This role has assigned users. Reassign them before changing its location.',
+
+        return res.status(400).json({
+          message: 'Some selected permissions do not exist',
+          invalidPermissions,
         })
       }
     }
 
+    // Update only name and description.
+    // is_hq_role remains unchanged in the database.
     await connection.query(
       `UPDATE roles
-       SET name = ?, description = ?, is_hq_role = ?
+       SET name = ?, description = ?
        WHERE id = ?`,
-      [name.trim(), description.trim(), isHqRole ? 1 : 0, id]
+      [name.trim(), description.trim(), id]
     )
+
+    // Replace the role's previous permissions.
+    await connection.query(
+      'DELETE FROM role_permissions WHERE role_id = ?',
+      [id]
+    )
+
+    if (permissionRows.length > 0) {
+      await connection.query(
+        `INSERT INTO role_permissions (role_id, permission_id)
+         VALUES ?`,
+        [
+          permissionRows.map((permission) => [
+            id,
+            permission.id,
+          ]),
+        ]
+      )
+    }
 
     await connection.commit()
 
-    res.json({
-      message: 'Role updated successfully',
+    return res.json({
+      message: 'Role and permissions updated successfully',
       role: {
         id,
         name: name.trim(),
         description: description.trim(),
-        isHqRole,
+        permissions: permissionRows.map(
+          (permission) => permission.name
+        ),
       },
     })
   } catch (error) {
-    if (connection) await connection.rollback()
+    if (connection) {
+      try {
+        await connection.rollback()
+      } catch (rollbackError) {
+        console.error(
+          'Role update rollback failed:',
+          rollbackError.message
+        )
+      }
+    }
 
     if (error.code === 'ER_DUP_ENTRY') {
       return res.status(409).json({
@@ -227,7 +347,8 @@ router.put('/:id', async (req, res, next) => {
       })
     }
 
-    next(error)
+    console.error('Update role error:', error)
+    return next(error)
   } finally {
     connection?.release()
   }
@@ -319,7 +440,7 @@ router.delete('/:id', async (req, res, next) => {
 })
 
 
-// PUT /api/roles/:id/permissions
+// PUT /api/roles/:id/permissionsa
 // Update permissions assigned to a role.
 router.put('/:id/permissions', async (req, res) => {
   const id = Number(req.params.id)

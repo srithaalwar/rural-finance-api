@@ -25,9 +25,9 @@ router.post('/login', async (req, res) => {
   if (user.status !== 'Active') {
     return res.status(403).json({ message: 'Account is inactive' })
   }
-  if (user.role !== 'Super Admin') {
-    return res.status(403).json({ message: 'This portal is for Super Admin only' })
-  }
+  // if (user.role !== 'Super Admin') {
+  //   return res.status(403).json({ message: 'This portal is for Super Admin only' })
+  // }
 
   const token = jwt.sign(
     { id: user.id, name: user.name, role: user.role },

@@ -79,30 +79,43 @@ router.get('/', async (req, res, next) => {
 
 // POST /api/users
 // Create a user without assigning a role or branch.
+// POST /api/users
+// Create a user without assigning a role or branch.
 router.post('/', async (req, res, next) => {
   let connection
 
   try {
-    const { name, email, mobile } = req.body
+    const { name, email, mobile, password } = req.body
 
-    if (!name?.trim() || !email?.trim()) {
+    // Validate required fields
+    if (!name?.trim() || !email?.trim() || !password) {
       return res.status(400).json({
-        message: 'Name and email are required',
+        message: 'Name, email and password are required',
       })
     }
 
+    if (password.length < 8) {
+      return res.status(400).json({
+        message: 'Password must contain at least 8 characters',
+      })
+    }
+
+    // Normalize email
     const normalizedEmail = email.trim().toLowerCase()
-    const hash = await bcrypt.hash(DEFAULT_PASSWORD, 10)
+
+    // Hash password before storing it
+    const hash = await bcrypt.hash(password, 10)
 
     connection = await pool.getConnection()
     await connection.beginTransaction()
 
+    // Check for duplicate email
     const [existing] = await connection.query(
       'SELECT id FROM users WHERE email = ?',
       [normalizedEmail]
     )
 
-    if (existing.length) {
+    if (existing.length > 0) {
       await connection.rollback()
 
       return res.status(409).json({
@@ -110,6 +123,7 @@ router.post('/', async (req, res, next) => {
       })
     }
 
+    // Insert user without assigning a role or branch
     const [result] = await connection.query(
       `INSERT INTO users
         (code, name, email, mobile, password_hash, role_id, branch_id)
@@ -123,6 +137,7 @@ router.post('/', async (req, res, next) => {
       ]
     )
 
+    // Generate the final user code
     const code = `U-${String(result.insertId).padStart(3, '0')}`
 
     await connection.query(
@@ -130,29 +145,47 @@ router.post('/', async (req, res, next) => {
       [code, result.insertId]
     )
 
+    // Commit only after both database operations succeed
     await connection.commit()
 
-    res.status(201).json({
+    return res.status(201).json({
       id: result.insertId,
       code,
       message: 'User created successfully. Role and branch are not assigned yet.',
     })
   } catch (error) {
+    // Roll back failed transactions safely
     if (connection) {
-      await connection.rollback()
+      try {
+        await connection.rollback()
+      } catch (rollbackError) {
+        console.error(
+          'Transaction rollback failed:',
+          rollbackError.message
+        )
+      }
     }
+
+    // Log the actual database error
+    console.error('CREATE USER FAILED:', {
+      code: error.code,
+      message: error.message,
+      sqlMessage: error.sqlMessage,
+    })
 
     if (error.code === 'ER_DUP_ENTRY') {
       return res.status(409).json({
-        message: 'A user with this email already exists',
+        message: 'A user with this email or code already exists',
       })
     }
 
-    next(error)
+    return next(error)
   } finally {
     connection?.release()
   }
 })
+
+
 
 // PATCH /api/users/:id/assign
 // Assign an existing user to a branch and a branch-level role.
